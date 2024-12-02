@@ -1,0 +1,152 @@
+ /// @https://wripple.net
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract Staking {
+    IERC20 public immutable token; // Token staking
+    address public admin;
+
+    uint256 public interestRate; // Annual interest rate (modifiable)
+    uint256 public claimCooldown = 300; // Cooldown between claims (seconds)
+    uint256 public maxStake = 100000000000 * 10**18; // Maximum stake per user
+
+    // Staking user data
+    mapping(address => uint256) public stakes; // Staked amount
+    mapping(address => uint256) public rewards; // Accumulated rewards (already claimed)
+    mapping(address => uint256) public lastClaimedTime; // Last claimed timestamp
+    mapping(address => uint256) public pendingRewards; // Pending rewards (not yet claimed)
+
+    // Referral system
+    mapping(address => address) public referrer; // Referee -> Referrer
+    mapping(address => uint256) public referralRewards; // Rewards earned from referrals
+
+    event Staked(address indexed user, uint256 amount);
+    event Unstaked(address indexed user, uint256 amount);
+    event Claimed(address indexed user, uint256 reward);
+    event ReferralReward(address indexed referrer, address indexed referee, uint256 amount);
+    event InterestRateChanged(uint256 newInterestRate);
+
+    constructor(IERC20 _token, uint256 _initialInterestRate) {
+        require(address(_token) != address(0), "Invalid token address");
+        token = _token;
+        admin = msg.sender;
+        interestRate = _initialInterestRate;
+    }
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin can perform this action");
+        _;
+    }
+
+    /// @notice Stake tokens with an optional referrer
+    function stake(uint256 _amount, address _referrer) external {
+        require(_amount > 0, "Amount must be greater than zero");
+        require(_amount + stakes[msg.sender] <= maxStake, "Exceeds maximum stake limit");
+
+        // Transfer tokens from the user to the contract
+        require(token.transferFrom(msg.sender, address(this), _amount), "Token transfer failed");
+
+        // Set referrer if not already set
+        if (referrer[msg.sender] == address(0) && _referrer != address(0) && _referrer != msg.sender) {
+            referrer[msg.sender] = _referrer;
+        }
+
+        // Calculate pending rewards and update staking data
+        uint256 pendingReward = calculateRewards(msg.sender);
+        rewards[msg.sender] += pendingReward; // Add pending rewards to claimed rewards
+        stakes[msg.sender] += _amount;
+        lastClaimedTime[msg.sender] = block.timestamp;
+        pendingRewards[msg.sender] += pendingReward; // Update pending rewards
+
+        emit Staked(msg.sender, _amount);
+    }
+
+    /// @notice Unstake a specific amount of tokens
+    function unstake(uint256 _amount) external {
+        require(_amount > 0, "Amount must be greater than zero");
+        require(_amount <= stakes[msg.sender], "Insufficient staked balance");
+
+        // Calculate pending rewards and update staking data
+        uint256 pendingReward = calculateRewards(msg.sender);
+        rewards[msg.sender] += pendingReward; // Add pending rewards to claimed rewards
+        stakes[msg.sender] -= _amount;
+        lastClaimedTime[msg.sender] = block.timestamp;
+        pendingRewards[msg.sender] += pendingReward; // Update pending rewards
+
+        // Transfer tokens back to the user
+        require(token.transfer(msg.sender, _amount), "Token transfer failed");
+
+        emit Unstaked(msg.sender, _amount);
+    }
+
+    /// @notice Claim accumulated rewards
+    function claim() external {
+        require(
+            block.timestamp >= lastClaimedTime[msg.sender] + claimCooldown,
+            "Claim too soon, wait for cooldown"
+        );
+
+        uint256 reward = calculateRewards(msg.sender) + rewards[msg.sender] + pendingRewards[msg.sender];
+        require(reward > 0, "No rewards to claim");
+
+        // Cap rewards at 50% of staked amount
+        uint256 maxReward = stakes[msg.sender] / 2; // 50% of staked amount
+        if (reward > maxReward) {
+            reward = maxReward;
+        }
+
+        // Reset rewards and update last claimed time
+        rewards[msg.sender] = 0;
+        pendingRewards[msg.sender] = 0; // Reset pending rewards after claim
+        lastClaimedTime[msg.sender] = block.timestamp;
+
+        // Transfer reward to the user
+        require(token.transfer(msg.sender, reward), "Reward transfer failed");
+
+        // Handle referral rewards (10% of the claimed reward)
+        address userReferrer = referrer[msg.sender];
+        if (userReferrer != address(0)) {
+            uint256 referralReward = (reward * 10) / 100; // 10% referral reward
+            referralRewards[userReferrer] += referralReward;
+            emit ReferralReward(userReferrer, msg.sender, referralReward);
+        }
+
+        emit Claimed(msg.sender, reward);
+    }
+
+    /// @notice Calculate rewards based on staking duration and interest rate
+    function calculateRewards(address _user) public view returns (uint256) {
+        uint256 stakedAmount = stakes[_user];
+        uint256 stakingDuration = block.timestamp - lastClaimedTime[_user];
+        // Rewards are proportional to staking duration
+        return (stakedAmount * interestRate * stakingDuration) / (365 days * 100); // Annual interest rate
+    }
+
+    /// @notice Allow admin to modify the interest rate
+    function setInterestRate(uint256 _newInterestRate) external onlyAdmin {
+        require(
+            _newInterestRate >= 5 && _newInterestRate <= 25,
+            "Interest rate must be between 5% and 25%"
+        );
+        interestRate = _newInterestRate;
+        emit InterestRateChanged(_newInterestRate);
+    }
+
+    /// @notice Get referral rewards for a specific referrer
+    function getReferralRewards(address _referrer) external view returns (uint256) {
+        return referralRewards[_referrer];
+    }
+
+    /// @notice Withdraw all tokens (emergency use only, admin-only)
+    function emergencyWithdraw() external onlyAdmin {
+        uint256 balance = token.balanceOf(address(this));
+        require(balance > 0, "No tokens to withdraw");
+        require(token.transfer(admin, balance), "Withdrawal failed");
+    }
+}
